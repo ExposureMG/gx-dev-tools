@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::fs::{self, File};
 use std::io::{Write, BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::env;
 use tempfile::NamedTempFile;
@@ -96,10 +96,9 @@ fn parse_gxs_file_recursive(dir: &Path, filename: &str, visited: &mut std::colle
     }
     visited.insert(path_str.clone());
     
-    let content = fs::read_to_string(&file_path)
-        .with_context(|| format!("Failed to read file: {}", file_path.display()))?;
-    
-    let lines: Vec<&str> = content.lines().collect();
+    let content = fs::read_to_string(&file_path).with_context(|| format!("Failed to read file: {}", file_path.display()))?;
+
+    let lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
     let mut records = Vec::new();
     let mut i = 0;
     
@@ -135,7 +134,7 @@ fn parse_gxs_file_recursive(dir: &Path, filename: &str, visited: &mut std::colle
         }
         
         // Parse regular GXS line
-        if let Some(rec) = parse_gxs_line(line) {
+        if let Some(rec) = parse_gxs_line(line)? {
             records.push(rec);
         }
         
@@ -148,34 +147,39 @@ fn parse_gxs_file_recursive(dir: &Path, filename: &str, visited: &mut std::colle
     Ok(records)
 }
 
-fn parse_gxs_line(line: &str) -> Option<GxsRecord> {
+fn parse_gxs_line(line: &str) -> Result<Option<GxsRecord>> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
-        return None;
+        return Ok(None);
     }
 
-    let parts: Vec<&str> = line.split(':').collect();
+    let parts: Vec<&str> = line.splitn(2, ':').collect();
     if parts.len() < 2 {
-        return None;
+        return Ok(None);
     }
 
     let addr_str = parts[0].trim();
-    let addr = if addr_str.starts_with("0x") {
-        u32::from_str_radix(&addr_str[2..], 16).ok()?
+    let addr = if let Some(hex) = addr_str.strip_prefix("0x") {
+        u32::from_str_radix(hex, 16).with_context(|| format!("Invalid address hex '{}'", addr_str))?
     } else {
-        addr_str.parse().ok()?
+        addr_str.parse().with_context(|| format!("Invalid address '{}'", addr_str))?
     };
 
     let data_str = parts[1].trim();
-    let data = data_str
-        .split_whitespace()
-        .filter_map(|s| u8::from_str_radix(s, 16).ok())
-        .collect();
+    if data_str.is_empty() {
+        return Err(anyhow::anyhow!("Missing hex data for address 0x{:08X}", addr));
+    }
 
-    Some(GxsRecord { addr, data })
+    let mut data = Vec::new();
+    for tok in data_str.split_whitespace() {
+        let b = u8::from_str_radix(tok, 16).with_context(|| format!("Invalid hex byte token '{}' at 0x{:08X}", tok, addr))?;
+        data.push(b);
+    }
+
+    Ok(Some(GxsRecord { addr, data }))
 }
 
-fn parse_asm_section(lines: &[&str], start_idx: usize) -> Option<AsmSection> {
+fn parse_asm_section(lines: &[String], start_idx: usize) -> Option<AsmSection> {
     if start_idx >= lines.len() {
         return None;
     }
@@ -196,13 +200,12 @@ fn parse_asm_section(lines: &[&str], start_idx: usize) -> Option<AsmSection> {
 
     // Collect ASM code lines
     let mut code_lines = Vec::new();
-    for &line in &lines[start_idx + 1..] {
+    for line in &lines[start_idx + 1..] {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        // Stop at [!ASM] end marker or next section/directive
-        if trimmed.starts_with("[!ASM]") || trimmed.starts_with('[') || trimmed.starts_with('.') {
+        if trimmed.starts_with("[!ASM]") {
             break;
         }
         code_lines.push(trimmed);
@@ -233,6 +236,27 @@ fn compile_asm_linux(asm: &AsmSection) -> Result<Vec<u8>> {
     try_assembler_compilation(asm)
 }
 
+fn resolve_tool_path(tool_name: &str) -> Result<PathBuf> {
+    let local = PathBuf::from("./bin").join(tool_name);
+    if local.exists() {
+        return Ok(local);
+    }
+
+    let exe = env::current_exe().context("Failed to resolve current executable path")?;
+    let exe_dir = exe.parent().ok_or_else(|| anyhow::anyhow!("Failed to resolve current executable directory"))?;
+    let adjacent = exe_dir.join("bin").join(tool_name);
+    if adjacent.exists() {
+        return Ok(adjacent);
+    }
+
+    Err(anyhow::anyhow!(
+        "Missing required tool '{}'. Looked in '{}' and '{}'",
+        tool_name,
+        local.display(),
+        adjacent.display()
+    ))
+}
+
 
 fn try_assembler_compilation(asm: &AsmSection) -> Result<Vec<u8>> {
     // Create temporary assembly file
@@ -257,25 +281,27 @@ _start:
     fs::write(asm_file.path(), asm_content)?;
     
     // Compile with local xenon-as (Linux version)
-    let output = Command::new("./bin/xenon-as")
+    let xenon_as = resolve_tool_path("xenon-as")?;
+    let output = Command::new(xenon_as)
         .arg("-o")
         .arg(obj_file.path())
         .arg(asm_file.path())
         .output()
-        .context("Failed to run ./bin/xenon-as")?;
+        .context("Failed to run xenon-as")?;
     
     if !output.status.success() {
         return Err(anyhow::anyhow!("Assembly compilation failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
     
     // Extract raw binary with local xenon-objcopy (Linux version)
-    let output = Command::new("./bin/xenon-objcopy")
+    let xenon_objcopy = resolve_tool_path("xenon-objcopy")?;
+    let output = Command::new(xenon_objcopy)
         .arg("-O")
         .arg("binary")
         .arg(obj_file.path())
         .arg(bin_file.path())
         .output()
-        .context("Failed to run ./bin/xenon-objcopy")?;
+        .context("Failed to run xenon-objcopy")?;
     
     if !output.status.success() {
         return Err(anyhow::anyhow!("Object copy failed: {}", String::from_utf8_lossy(&output.stderr)));
@@ -298,25 +324,27 @@ fn compile_asm_windows(asm: &AsmSection) -> Result<Vec<u8>> {
     fs::write(asm_file.path(), asm_content)?;
     
     // Compile with local xenon-as.exe
-    let output = Command::new("./bin/xenon-as.exe")
+    let xenon_as = resolve_tool_path("xenon-as.exe")?;
+    let output = Command::new(xenon_as)
         .arg("-o")
         .arg(obj_file.path())
         .arg(asm_file.path())
         .output()
-        .context("Failed to run ./bin/xenon-as.exe")?;
+        .context("Failed to run xenon-as.exe")?;
     
     if !output.status.success() {
         return Err(anyhow::anyhow!("Assembly compilation failed: {}", String::from_utf8_lossy(&output.stderr)));
     }
     
     // Extract raw binary with local xenon-objcopy.exe
-    let output = Command::new("./bin/xenon-objcopy.exe")
+    let xenon_objcopy = resolve_tool_path("xenon-objcopy.exe")?;
+    let output = Command::new(xenon_objcopy)
         .arg("-O")
         .arg("binary")
         .arg(obj_file.path())
         .arg(bin_file.path())
         .output()
-        .context("Failed to run ./bin/xenon-objcopy.exe")?;
+        .context("Failed to run xenon-objcopy.exe")?;
     
     if !output.status.success() {
         return Err(anyhow::anyhow!("Object copy failed: {}", String::from_utf8_lossy(&output.stderr)));
@@ -339,7 +367,15 @@ fn main() -> Result<()> {
             let clean_data = fs::read(&clean).with_context(|| format!("Failed to read {}", clean))?;
             let patched_data = fs::read(&patched).with_context(|| format!("Failed to read {}", patched))?;
 
-            let len = clean_data.len().min(patched_data.len());
+            if clean_data.len() != patched_data.len() {
+                return Err(anyhow::anyhow!(
+                    "Diff requires equal-length binaries (clean=0x{:X}, patched=0x{:X})",
+                    clean_data.len(),
+                    patched_data.len()
+                ));
+            }
+
+            let len = clean_data.len();
             let mut diffs = Vec::new();
             let mut current_block: Option<(usize, Vec<u8>)> = None;
 
@@ -365,8 +401,10 @@ fn main() -> Result<()> {
 
             println!("# GXP-Source (GXS): {}", title);
             for (start, data) in diffs {
-                let addr = offset_val + start as u32;
-                println!("0x{:04X}: {}", addr, hex_format(&data));
+                let addr = offset_val
+                    .checked_add(start as u32)
+                    .ok_or_else(|| anyhow::anyhow!("Address overflow: offset 0x{:X} + start 0x{:X}", offset_val, start))?;
+                println!("0x{:08X}: {}", addr, hex_format(&data));
             }
         }
         Commands::Convert { input, out_dir, addon } => {
@@ -450,7 +488,7 @@ fn main() -> Result<()> {
                     
                     if line.starts_with("[ASM]") {
                         // Parse ASM section
-                        if let Some(asm_section) = parse_asm_section(&lines.iter().map(|s| s.as_str()).collect::<Vec<_>>(), i) {
+                        if let Some(asm_section) = parse_asm_section(&lines, i) {
                             match compile_asm_section(&asm_section) {
                                 Ok(compiled_data) => {
                                     records.push(GxsRecord {
@@ -480,7 +518,7 @@ fn main() -> Result<()> {
                         i += 1;
                     } else {
                         // Parse regular GXS line
-                        if let Some(rec) = parse_gxs_line(line) {
+                        if let Some(rec) = parse_gxs_line(line)? {
                             records.push(rec);
                         }
                         i += 1;
@@ -490,7 +528,7 @@ fn main() -> Result<()> {
                 // Compile records to binary blocks
                 // Logic: Merge contiguous addresses into single 4-byte word blocks
                 // For simplicity and compatibility with xeBuild format, we group into 4-byte aligned blocks
-                let compiled_blocks = compile_gxs_to_blocks(records);
+                let compiled_blocks = compile_gxs_to_blocks(records)?;
                 
                 for (addr, data) in compiled_blocks {
                     gxp_file.write_all(&addr.to_be_bytes())?;
@@ -511,8 +549,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn compile_gxs_to_blocks(mut records: Vec<GxsRecord>) -> Vec<(u32, Vec<u8>)> {
-    if records.is_empty() { return vec![]; }
+fn compile_gxs_to_blocks(mut records: Vec<GxsRecord>) -> Result<Vec<(u32, Vec<u8>)>> {
+    if records.is_empty() {
+        return Ok(vec![]);
+    }
     records.sort_by_key(|r| r.addr);
 
     let mut blocks = Vec::new();
@@ -520,6 +560,12 @@ fn compile_gxs_to_blocks(mut records: Vec<GxsRecord>) -> Vec<(u32, Vec<u8>)> {
     let mut current_data = Vec::new();
 
     for rec in records {
+        if rec.addr % 4 != 0 {
+            return Err(anyhow::anyhow!("Unaligned GXS record address: 0x{:08X} (expected 4-byte aligned)", rec.addr));
+        }
+        if rec.data.is_empty() {
+            continue;
+        }
         if !current_data.is_empty() && rec.addr != current_addr + current_data.len() as u32 {
             // Finish current block (pad to 4 bytes)
             while current_data.len() % 4 != 0 { current_data.push(0); }
@@ -535,7 +581,7 @@ fn compile_gxs_to_blocks(mut records: Vec<GxsRecord>) -> Vec<(u32, Vec<u8>)> {
         blocks.push((current_addr, current_data));
     }
 
-    blocks
+    Ok(blocks)
 }
 
 fn write_part(out_dir: &Path, idx: usize, records: &[(u32, Vec<u8>)], original: &str) -> Result<()> {
@@ -546,7 +592,7 @@ fn write_part(out_dir: &Path, idx: usize, records: &[(u32, Vec<u8>)], original: 
     writeln!(file, "")?;
 
     for (addr, data) in records {
-        writeln!(file, "0x{:04X}: {}", addr, hex_format(data))?;
+        writeln!(file, "0x{:08X}: {}", addr, hex_format(data))?;
     }
     println!("Created {}", filename);
     Ok(())
